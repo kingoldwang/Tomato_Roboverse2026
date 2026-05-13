@@ -15,13 +15,20 @@ async def run():
             print(f"✅ Connected to drone")
             break
 
+    # Disable simulated battery drain (SITL only)
+    await drone.param.set_param_float("SIM_BAT_MIN_PCT", 99.0)
+
     # Wait for system health
     print("🩺 Waiting for system health...")
     async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
+        if (health.is_gyrometer_calibration_ok
+            and health.is_accelerometer_calibration_ok
+            and health.is_magnetometer_calibration_ok
+            and health.is_local_position_ok
+            and health.is_global_position_ok
+            and health.is_home_position_ok):
             print("✅ System healthy. Ready.")
             break
-
 
     print("-- Arming")
     await drone.action.arm()
