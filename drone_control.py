@@ -1,6 +1,7 @@
 from mavsdk import System
 from mavsdk.offboard import Offboard
 from mavsdk.offboard import VelocityNedYaw, PositionNedYaw
+from mavsdk.telemetry import LandedState
 import asyncio
 import math
 
@@ -31,20 +32,47 @@ class Drone:
                 print("Connected")
                 break
 
-    async def arm_and_takeoff(self):
+        # Disable simulated battery drain (SITL only)
+        await self.drone.param.set_param_float("SIM_BAT_MIN_PCT", 99.0)
+
+        print("Waiting for EKF / global position...")
+        async for health in self.drone.telemetry.health():
+            if health.is_global_position_ok and health.is_home_position_ok:
+                print("EKF ready")
+                break
+
+    async def arm_and_takeoff(self, target_altitude=2.5, timeout=30.0):
         await self.drone.action.arm()
         await self.drone.action.takeoff()
-        await asyncio.sleep(20)
+
+        async def _wait_altitude():
+            async for pos in self.drone.telemetry.position():
+                if pos.relative_altitude_m >= target_altitude - 0.2:
+                    return
+
+        try:
+            await asyncio.wait_for(_wait_altitude(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"Takeoff did not reach {target_altitude} m within {timeout}s")
+
         print("Takeoff")
- # Required before start
         await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
-        # start offboard mode
         await self.drone.offboard.start()
 
-    async def land(self):
+    async def land(self, timeout=30.0):
         await self.drone.offboard.stop()
         await self.drone.action.land()
-        await asyncio.sleep(10)
+
+        async def _wait_landed():
+            async for landed in self.drone.telemetry.landed_state():
+                if landed == LandedState.ON_GROUND:
+                    return
+
+        try:
+            await asyncio.wait_for(_wait_landed(), timeout=timeout)
+        except asyncio.TimeoutError:
+            print(f"Land timed out after {timeout}s, forcing disarm")
+
         print("land")
         await self.drone.action.disarm()
 
