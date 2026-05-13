@@ -11,9 +11,11 @@ from get_position_with_task import SharedState, position_monitor_task
 class DroneNavigation:
     def __init__(self,
                  depth_topic="/depth_camera",
-                 loop_hz=20.0):
+                 loop_hz=20.0,
+                 max_runtime_s=60.0):
 
         self.loop_hz = loop_hz
+        self.max_runtime_s = max_runtime_s
         self.running = True
 
         # =========================
@@ -96,31 +98,51 @@ class DroneNavigation:
     # =========================
     # tHE MAIN LOOP WHERE THE PIPELINE COMES TOGETHER
     # =========================
+    async def _wait_for_first_data(self, timeout=10.0):
+        """Block until position monitor and depth receiver have their first frame."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if (self.position_state.latest_position is not None
+                and self.position_state.latest_yaw is not None
+                and self.receiver.get_frame() is not None):
+                return
+            await asyncio.sleep(0.1)
+        raise RuntimeError("Timed out waiting for first position/depth data")
+
     async def run(self):
         print("\nPOSITION-BASED AUTONOMOUS AvoidanceNAVIGATION\n")
 
         await self.drone.connect()
-        await asyncio.sleep(3)
         print("Starting position monitor.")
-        self.monitor_task = asyncio.create_task(position_monitor_task(self.drone, self.position_state, asyncio.Event()))
+        self._monitor_stop = asyncio.Event()
+        self.monitor_task = asyncio.create_task(
+            position_monitor_task(self.drone, self.position_state, self._monitor_stop)
+        )
         await self.drone.arm_and_takeoff()
+
+        print("Waiting for first position + depth frame...")
+        await self._wait_for_first_data()
+
         # Initial alignment
         await self.drone.rotate_to_yaw(self.target_yaw_deg)
+
+        t_run_start = time.monotonic()
 
         try:
             while self.running:
                 t_start = time.monotonic()
 
-                # -----------------------------------
-                # UPDATE POSE (CRITICAL)
-                # -----------------------------------
+                if t_start - t_run_start > self.max_runtime_s:
+                    print(f"\nMax runtime {self.max_runtime_s}s reached, ending flight.")
+                    break
+
                 await self.update_pose()
 
                 depth_frame = self.receiver.get_frame()
+                if depth_frame is None:
+                    await asyncio.sleep(1.0 / self.loop_hz)
+                    continue
 
-                # -----------------------------------
-                # POSITION PLANNER
-                # -----------------------------------
                 north, east, down, info = self.planner.compute_position_ned(
                     depth_frame,
                     self.pose,
@@ -133,19 +155,11 @@ class DroneNavigation:
                       f"Target N={north:.2f}, E={east:.2f} | "
                       f"L={c['left']:.2f} C={c['center']:.2f} R={c['right']:.2f}")
 
-                # ===================================
-                #  BLOCK HANDLING
-                # ===================================
                 if info['blocked']:
                     await self.drone.send_velocity(0, 0, 0, self.target_yaw_deg)
                     await self.rotate_next_direction()
                 else:
-                    # Ensure alignment before motion
                     await self.align_to_grid()
-
-                    # -----------------------------------
-                    #  SEND POSITION SETPOINT
-                    # -----------------------------------
                     await self.drone.send_position_setpoint(
                         north=north,
                         east=east,
@@ -153,18 +167,27 @@ class DroneNavigation:
                         yaw_deg=self.target_yaw_deg
                     )
 
-                # Maintain loop timing
                 elapsed = time.monotonic() - t_start
                 sleep_time = (1.0 / self.loop_hz) - elapsed
                 if sleep_time > 0:
                     await asyncio.sleep(sleep_time)
 
         except asyncio.CancelledError:
-            print("🛑 Navigation cancelled")
+            print("Navigation cancelled")
 
         finally:
-            await self.drone.send_velocity(0, 0, 0, self.target_yaw_deg)
-            print("Drone hovering safely")
+            print("Landing...")
+            try:
+                await self.drone.land()
+            except Exception as e:
+                print(f"Land failed: {e}")
+            self._monitor_stop.set()
+            self.monitor_task.cancel()
+            try:
+                await self.monitor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            print("Shutdown complete.")
 
     def stop(self):
         self.running = False
