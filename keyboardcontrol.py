@@ -18,9 +18,6 @@ Controls:
   T         Arm + Takeoff
   L         Land
   Q         Quit
-
-Install:
-  pip install mavsdk
 """
 
 import asyncio
@@ -35,7 +32,7 @@ from mavsdk import System
 from mavsdk.offboard import OffboardError, VelocityBodyYawspeed
 
 # ── Tunable parameters ──────────────────────────────────────────────────────
-MAVSDK_ADDRESS   = "udp://:14540"
+MAVSDK_ADDRESS   = "udpin://0.0.0.0:14540"
 TAKEOFF_ALTITUDE = 2.5              # metres
 
 SPEED_XY      = 1.0    # m/s  horizontal body velocity
@@ -44,12 +41,20 @@ YAW_RATE      = 30.0   # deg/s
 
 KEY_HOLD_TIMEOUT = 0.12   # seconds – key considered released after this
 
+# Maps key -> (forward_m_s, right_m_s, down_m_s, yawspeed_deg_s)
+VEL_MAP = {
+    'u': ( SPEED_XY,  0.0,       0.0,      0.0     ),  # forward
+    'j': (-SPEED_XY,  0.0,       0.0,      0.0     ),  # backward
+    'h': ( 0.0,      -SPEED_XY,  0.0,      0.0     ),  # left
+    'k': ( 0.0,       SPEED_XY,  0.0,      0.0     ),  # right
+    'w': ( 0.0,       0.0,      -SPEED_Z,  0.0     ),  # climb
+    's': ( 0.0,       0.0,       SPEED_Z,  0.0     ),  # descend
+    'a': ( 0.0,       0.0,       0.0,     -YAW_RATE),  # yaw CCW
+    'd': ( 0.0,       0.0,       0.0,      YAW_RATE),  # yaw CW
+}
+
 # ── Shared state ──────────────────────────────────────────────────────────────
 class State:
-    forward_m_s : float = 0.0
-    right_m_s   : float = 0.0
-    down_m_s    : float = 0.0
-    yaw_deg_s   : float = 0.0
     running         : bool = True
     takeoff         : bool = False
     land            : bool = False
@@ -57,12 +62,12 @@ class State:
 
 state = State()
 
-# ── Active key tracking ───────────────────────────────────────────────────────
+# Active key tracking (single source of truth for velocity)
 _key_lock      = threading.Lock()
 _active_key    = ''
 _active_key_ts = 0.0
 
-def _update_active_key(k: str):
+def _set_active_key(k: str):
     global _active_key, _active_key_ts
     with _key_lock:
         _active_key    = k
@@ -74,24 +79,12 @@ def _get_active_key() -> str:
             return _active_key
         return ''
 
-# Maps key -> (forward, right, down, yaw_deg_s)
-VEL_MAP = {
-    'u': ( SPEED_XY,  0.0,       0.0,      0.0     ),  # pitch forward
-    'j': (-SPEED_XY,  0.0,       0.0,      0.0     ),  # pitch backward
-    'h': ( 0.0,      -SPEED_XY,  0.0,      0.0     ),  # roll left
-    'k': ( 0.0,       SPEED_XY,  0.0,      0.0     ),  # roll right
-    'w': ( 0.0,       0.0,      -SPEED_Z,  0.0     ),  # throttle up (climb)
-    's': ( 0.0,       0.0,       SPEED_Z,  0.0     ),  # throttle down (descend)
-    'a': ( 0.0,       0.0,       0.0,     -YAW_RATE),  # yaw CCW
-    'd': ( 0.0,       0.0,       0.0,      YAW_RATE),  # yaw CW
-}
-
 # ── Terminal helpers ──────────────────────────────────────────────────────────
 class RawTerminal:
     def __enter__(self):
         self.fd  = sys.stdin.fileno()
         self.old = termios.tcgetattr(self.fd)
-        tty.setraw(self.fd)
+        tty.setcbreak(self.fd)
         return self
 
     def __exit__(self, *_):
@@ -131,64 +124,55 @@ def keyboard_thread():
                 continue
 
             if key in VEL_MAP:
-                _update_active_key(key)
-                fwd, rgt, dwn, yaw = VEL_MAP[key]
-                state.forward_m_s += fwd
-                state.right_m_s += rgt
-                state.down_m_s += dwn
-                out(f"\r[KEY] {key.upper()}  fwd={state.forward_m_s:+.1f} rgt={state.right_m_s:+.1f} "
-                    f"dwn={state.down_m_s:+.1f} yaw={yaw:+.1f}   ")
-
+                _set_active_key(key)
             elif key == ' ':
-                _update_active_key('')
-                out("\n[KEY] SPACE -> Full stop\n")
-
+                _set_active_key('')
             elif key == 't':
                 state.takeoff = True
-                out("\n[KEY] T -> Takeoff requested\n")
-
             elif key == 'l':
                 state.land = True
-                out("\n[KEY] L -> Land requested\n")
-
             elif key == 'q':
                 state.running = False
-                out("\n[KEY] Q -> Quit\n")
                 break
 
 # ── MAVSDK helpers ────────────────────────────────────────────────────────────
 async def connect(drone: System):
     print(f"[MAVSDK] Connecting to {MAVSDK_ADDRESS} ...")
     await drone.connect(system_address=MAVSDK_ADDRESS)
-    async for health in drone.telemetry.health():
-        print(f"[HEALTH] GPS={health.is_global_position_ok}  "
-              f"Home={health.is_home_position_ok}  "
-              f"Arm={health.is_armable}")
-        if health.is_global_position_ok and health.is_home_position_ok:
+
+    async for s in drone.core.connection_state():
+        if s.is_connected:
+            print("[MAVSDK] Connected.")
             break
-    print("[MAVSDK] Connected and healthy.")
+
+    # SITL convenience: pin simulated battery so it never goes unhealthy
+    try:
+        await drone.param.set_param_float("SIM_BAT_MIN_PCT", 99.0)
+    except Exception:
+        pass
+
+    print("[MAVSDK] Waiting for health (GPS + home)...")
+    async for health in drone.telemetry.health():
+        if health.is_global_position_ok and health.is_home_position_ok:
+            print("[MAVSDK] Healthy.")
+            break
 
 
 async def arm_and_takeoff(drone: System):
-    print("[MAVSDK] Arming ...")
+    print("[MAVSDK] Arming...")
     await drone.action.arm()
     print(f"[MAVSDK] Taking off to {TAKEOFF_ALTITUDE} m ...")
     await drone.action.takeoff()
-    print("[MAVSDK] Waiting for target altitude ...")
     async for pos in drone.telemetry.position():
         alt = pos.relative_altitude_m
-        sys.stdout.write(f"\r[MAVSDK] Alt: {alt:.2f} / {TAKEOFF_ALTITUDE:.2f} m   ")
-        sys.stdout.flush()
+        out(f"\r[MAVSDK] Alt: {alt:.2f} / {TAKEOFF_ALTITUDE:.2f} m   ")
         if alt >= TAKEOFF_ALTITUDE - 0.20:
             break
     print(f"\n[MAVSDK] Reached {alt:.2f} m – takeoff complete.")
 
 
 async def start_offboard(drone: System):
-    # Bootstrap: send zero velocity setpoint before starting offboard
-    await drone.offboard.set_velocity_body(
-        VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0)
-    )
+    await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
     try:
         await drone.offboard.start()
         state.offboard_active = True
@@ -213,8 +197,8 @@ async def control_loop(drone: System):
         if state.land:
             state.land            = False
             state.offboard_active = False
-            _update_active_key('')
-            print("[MAVSDK] Landing ...")
+            _set_active_key('')
+            print("[MAVSDK] Landing...")
             try:
                 await drone.offboard.stop()
             except Exception:
@@ -227,23 +211,23 @@ async def control_loop(drone: System):
             await asyncio.sleep(dt)
             continue
 
+        # Stateless velocity: held key → velocity, otherwise hover.
         active = _get_active_key()
         fwd, rgt, dwn, yaw = VEL_MAP.get(active, (0.0, 0.0, 0.0, 0.0))
 
         if active != prev_key:
             if active:
                 print(f"\n[CTL] '{active.upper()}' ACTIVE  "
-                      f"fwd={state.forward_m_s:+.1f} rgt={state.right_m_s:+.1f} "
-                      f"dwn={state.down_m_s:+.1f} yaw={yaw:+.1f}")
+                      f"fwd={fwd:+.1f} rgt={rgt:+.1f} dwn={dwn:+.1f} yaw={yaw:+.1f}")
             else:
-                print(f"\n[CTL] Released – hovering")
+                print("\n[CTL] Hovering")
             prev_key = active
 
         await drone.offboard.set_velocity_body(
             VelocityBodyYawspeed(
-                forward_m_s  = state.forward_m_s ,
-                right_m_s    = state.right_m_s ,
-                down_m_s     = state.down_m_s,
+                forward_m_s    = fwd,
+                right_m_s      = rgt,
+                down_m_s       = dwn,
                 yawspeed_deg_s = yaw,
             )
         )
@@ -252,7 +236,7 @@ async def control_loop(drone: System):
 
 
 async def shutdown(drone: System):
-    print("[MAVSDK] Shutting down ...")
+    print("[MAVSDK] Shutting down...")
     state.offboard_active = False
     try:
         await drone.offboard.stop()
