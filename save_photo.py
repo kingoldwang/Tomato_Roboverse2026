@@ -2,67 +2,47 @@ import time
 import numpy as np
 import cv2
 import os
-# Import Gazebo transport and message bindings
 from gz.transport13 import Node
 from gz.msgs10.image_pb2 import Image
 
-# Global counter to give each file a unique name
-image_count = 0
-# Directory to save images
-save_dir = "captured_images"
+SAVE_INTERVAL_S = 1.5
+SAVE_DIR = "captured_images"
+TOPIC = "/world/roboverse/model/x500_depth_0/link/camera_link/sensor/IMX214/image"
 
-# Create the directory if it doesn't exist
-if not os.path.exists(save_dir):
-    os.makedirs(save_dir)
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+state = {"count": 0, "last_save": 0.0}
 
 def image_callback(msg: Image):
-    """
-    Callback function that triggers every time a new image message is received.
-    """
-    global image_count
-    
-    # 1. Convert Gazebo raw bytes to a NumPy array
-    frame = np.frombuffer(msg.data, dtype=np.uint8)
-    
-    # 2. Reshape into (height, width, 3)
-    frame = frame.reshape((msg.height, msg.width, 3))
-    
-    # 3. Convert RGB (Gazebo) to BGR (OpenCV)
+    frame = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    
-    # 4. Save to file
-    # Filename format: captured_images/frame_0001.jpg
-    filename = os.path.join(save_dir, f"frame_{image_count:04d}.jpg")
-    cv2.imwrite(filename, frame_bgr)
-    
-    print(f"Saved: {filename}")
-    image_count += 1
-    
-    # 5. Display the resulting frame
+
     cv2.imshow("Gazebo Live Feed", frame_bgr)
     cv2.waitKey(1)
 
-def main():
-    # 1. Initialize the Gazebo Transport Node
-    node = Node()
-    
-    # 2. Define the topic name
-    image_topic = "/world/roboverse/model/x500_vision_0/link/camera_link/sensor/IMX214/image" 
-    
-    # 3. Subscribe to the topic
-    if node.subscribe(Image, image_topic, image_callback):
-        print(f"Subscribed to {image_topic}. Images will be saved to '{save_dir}/'.")
-        print("Press Ctrl+C to stop.")
-    else:
-        print(f"Failed to subscribe to {image_topic}. Is Gazebo running?")
+    now = time.monotonic()
+    if now - state["last_save"] < SAVE_INTERVAL_S:
         return
+    state["last_save"] = now
 
-    # 4. Keep the script alive
+    filename = os.path.join(SAVE_DIR, f"frame_{state['count']:04d}.jpg")
+    cv2.imwrite(filename, frame_bgr)
+    state["count"] += 1
+    print(f"Saved: {filename}")
+
+def main():
+    node = Node()
+    if not node.subscribe(Image, TOPIC, image_callback):
+        print(f"Failed to subscribe to {TOPIC}. Is Gazebo running?")
+        return
+    print(f"Subscribed to {TOPIC}")
+    print(f"Saving 1 frame every {SAVE_INTERVAL_S}s to '{SAVE_DIR}/'. Ctrl+C to stop.")
+
     try:
         while True:
             time.sleep(0.01)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print(f"\nStopped. Total saved: {state['count']}")
     finally:
         cv2.destroyAllWindows()
 

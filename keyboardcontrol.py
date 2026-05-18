@@ -35,9 +35,9 @@ from mavsdk.offboard import OffboardError, VelocityBodyYawspeed
 MAVSDK_ADDRESS   = "udpin://0.0.0.0:14540"
 TAKEOFF_ALTITUDE = 2.5              # metres
 
-SPEED_XY      = 1.0    # m/s  horizontal body velocity
-SPEED_Z       = 1.0    # m/s  vertical velocity
-YAW_RATE      = 30.0   # deg/s
+SPEED_XY      = 2.0    # m/s  horizontal body velocity
+SPEED_Z       = 1.5    # m/s  vertical velocity
+YAW_RATE      = 60.0   # deg/s
 
 KEY_HOLD_TIMEOUT = 0.12   # seconds – key considered released after this
 
