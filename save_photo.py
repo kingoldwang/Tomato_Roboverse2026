@@ -11,7 +11,10 @@ TOPIC = "/world/roboverse/model/x500_depth_0/link/camera_link/sensor/IMX214/imag
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-state = {"count": 0, "last_save": 0.0}
+existing = [f for f in os.listdir(SAVE_DIR) if f.startswith("frame_") and f.endswith(".jpg")]
+start_count = max([int(f[6:10]) for f in existing], default=-1) + 1
+
+state = {"count": start_count, "last_save": 0.0}
 
 def image_callback(msg: Image):
     frame = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
