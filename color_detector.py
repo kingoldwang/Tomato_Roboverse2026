@@ -65,6 +65,23 @@ class ColorDetector:
                self._extract(self._mask(hsv, "red"),    "red")
 
     @staticmethod
+    def classify_color(crop_bgr: np.ndarray, min_ratio: float = 0.03):
+        """Return 'yellow', 'red', or None for a BGR crop based on dominant target color."""
+        if crop_bgr is None or crop_bgr.size == 0:
+            return None
+        hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+        yellow_mask = cv2.inRange(hsv, YELLOW_LO, YELLOW_HI)
+        red_mask = cv2.inRange(hsv, RED_LO_1, RED_HI_1) | cv2.inRange(hsv, RED_LO_2, RED_HI_2)
+        yellow_count = int(np.count_nonzero(yellow_mask))
+        red_count = int(np.count_nonzero(red_mask))
+        total = crop_bgr.shape[0] * crop_bgr.shape[1]
+        if total == 0:
+            return None
+        if yellow_count / total < min_ratio and red_count / total < min_ratio:
+            return None  # neither colour dominates → reject (likely wall/architecture)
+        return "yellow" if yellow_count > red_count else "red"
+
+    @staticmethod
     def annotate(frame_bgr: np.ndarray, detections: list[dict]) -> np.ndarray:
         out = frame_bgr.copy()
         for d in detections:
