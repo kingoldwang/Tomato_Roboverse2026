@@ -1,0 +1,8 @@
+path: /content/data
+train: train/images
+val: valid/images
+test: test/images
+nc: 2
+names:
+- red_barrel
+- yellow_barrel
