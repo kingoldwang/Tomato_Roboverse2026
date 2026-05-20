@@ -12,12 +12,15 @@ RoboVerse 2026 Qualifier — autonomous mission.
 Without step 2, is_home_position_ok will never be True and arming will fail.
 
 Extends MinimalAutonomy (organiser baseline):
-- Reactive depth-based navigation kept intact
 - CRITICAL_DISTANCE_M raised from 0.3m to 1.5m per organiser guidance
 - FORWARD_SPEED_M_S bumped from 0.8 to 1.2 m/s
 - Readiness check uses is_home_position_ok (NOT is_global_position_ok — vision has no GPS)
-- Visited-cell tracking biases turn direction toward unexplored areas
-- Three altitude phases: 2m (yellow + 1-stack red), 4m (2-stack red), 6m (3-stack red)
+- Single-pass waypoint tour over 14 calibrated NED waypoints (workshop map)
+- Per-waypoint multi-altitude scans (2m/4m/6m) only where needed:
+    * box waypoints: all altitudes (yellow + 1-stack + 2-stack + 3-stack red possible)
+    * top_room: 2m only (yellow ground level)
+    * right_chamber: 4m + 6m (elevated red)
+- Goal-directed reactive nav between waypoints (depth avoidance + target heading)
 - YOLO + HSV detection runs continuously as background asyncio task
 - Detection JPGs saved to output/ as evidence for the judge
 """
@@ -35,17 +38,40 @@ class Mission(MinimalAutonomy):
     CRITICAL_DISTANCE_M = 1.5
     FORWARD_SPEED_M_S = 1.2
 
-    PHASE_DURATIONS_S = [240, 180, 120]
-    PHASE_ALTITUDES_M = [2.0, 4.0, 6.0]
+    BASE_ALTITUDE_M = 2.0      # cruise altitude between waypoints
+    ALL_ALTITUDES_M = [2.0, 4.0, 6.0]
+    GROUND_ALT_M = [2.0]       # yellow barrels (ground level only)
+    ELEVATED_ALT_M = [4.0, 6.0]  # red barrels (elevated only)
 
-    CLIMB_SPEED_M_S = 0.8
+    CLIMB_SPEED_M_S = 1.2
     ALTITUDE_TOLERANCE_M = 0.3
     DETECTION_BURST_FRAMES = 5
     DETECTION_TRIGGER_INTERVAL_S = 2.0
+    STUCK_THRESHOLD = 3
 
-    CELL_SIZE_M = 4.0          # arena grid is 4×4m per organiser
-    SIMILAR_CLEARANCE_M = 1.0  # L/R within this → use visited info as tiebreak
-    STUCK_THRESHOLD = 3        # consecutive STOPs before forcing a 180° escape
+    # Single-pass waypoint tour with per-waypoint scan altitudes
+    # name, N, E, scan_altitudes (None = transit only)
+    WAYPOINTS = [
+        ("box_NW",         16.13,  0.38, ALL_ALTITUDES_M),    # SCAN — covers box
+        ("box_NE",         15.93, 15.59, ALL_ALTITUDES_M),    # SCAN — covers box other angle
+        ("box_exit",       17.59,  8.11, None),               # transit (W back to opening)
+        ("corridor",       27.70,  7.77, None),               # transit (N through opening)
+        ("tunnel_entry",   29.94, 19.64, None),               # transit (E along upper corridor)
+        ("tunnel_bend",    35.62, 18.36, None),               # transit (N up top-room tunnel)
+        ("tunnel_aligned", 35.73, 16.15, None),               # transit (W after bend)
+        ("top_room",       40.17, 15.84, GROUND_ALT_M),       # SCAN — yellow only
+        ("back_aligned",   35.73, 16.15, None),               # backtrack
+        ("back_bend",      35.62, 18.36, None),
+        ("back_entry",     29.94, 19.64, None),
+        ("corridor_east",  27.50, 31.95, None),               # transit (E along corridor)
+        ("alcove_entry",   21.54, 32.19, None),               # transit (S into tunnel)
+        ("right_chamber",  17.77, 32.43, ELEVATED_ALT_M),     # SCAN — elevated red only
+    ]
+    WAYPOINT_TOLERANCE_M = 1.5
+    WAYPOINT_TIMEOUT_S = 60.0
+    HEADING_TOLERANCE_DEG = 20.0
+    SCAN_QUARTER_HOLD_S = 1.0
+    SCAN_YAW_RATE_DEG_S = 90.0
 
     def __init__(self, depth_topic="/depth_camera", rgb_topic=RGB_TOPIC, model_path="barrels_v2.pt"):
         super().__init__(depth_topic=depth_topic)
@@ -57,56 +83,7 @@ class Mission(MinimalAutonomy):
         )
         self.current_ned = None
         self.current_yaw_deg = None
-        self.visited_cells = set()
         self.stuck_count = 0
-
-    def _cell_for(self, x, y):
-        return (int(x // self.CELL_SIZE_M), int(y // self.CELL_SIZE_M))
-
-    def _predict_turn_cell(self, direction):
-        """Cell drone would enter after a 90° turn + forward step."""
-        if self.current_ned is None or self.current_yaw_deg is None:
-            return None
-        x, y = self.current_ned
-        delta = -90 if direction == "left" else 90
-        new_yaw_rad = math.radians(self.current_yaw_deg + delta)
-        # NED: yaw 0 = +X (North), yaw 90 = +Y (East), clockwise
-        dx = math.cos(new_yaw_rad) * self.CELL_SIZE_M
-        dy = math.sin(new_yaw_rad) * self.CELL_SIZE_M
-        return self._cell_for(x + dx, y + dy)
-
-    def decide_motion(self, left, center, right):
-        if center >= self.SAFE_DISTANCE_M:
-            self.stuck_count = 0
-            return "FORWARD", self.DECISION_PERIOD_S
-
-        if (left < self.CRITICAL_DISTANCE_M
-                and center < self.CRITICAL_DISTANCE_M
-                and right < self.CRITICAL_DISTANCE_M):
-            self.stuck_count += 1
-            if self.stuck_count >= self.STUCK_THRESHOLD:
-                self.stuck_count = 0
-                print("  ESCAPE: stuck — turning 180°")
-                return "TURN_180", 180.0 / self.YAW_RATE_DEG_S
-            return "STOP", self.DECISION_PERIOD_S
-
-        self.stuck_count = 0
-
-        # Tiebreak by visited-cell info when L/R clearances are close
-        if abs(left - right) < self.SIMILAR_CLEARANCE_M:
-            left_cell = self._predict_turn_cell("left")
-            right_cell = self._predict_turn_cell("right")
-            if left_cell is not None and right_cell is not None:
-                left_unvisited = left_cell not in self.visited_cells
-                right_unvisited = right_cell not in self.visited_cells
-                if left_unvisited and not right_unvisited:
-                    return "TURN_LEFT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
-                if right_unvisited and not left_unvisited:
-                    return "TURN_RIGHT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
-
-        if left >= right:
-            return "TURN_LEFT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
-        return "TURN_RIGHT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
 
     async def wait_until_ready(self, timeout_s=60.0):
         """Vision drone readiness: wait for is_home_position_ok (NOT GPS).
@@ -152,13 +129,13 @@ class Mission(MinimalAutonomy):
                 await asyncio.sleep(3.0)
 
         try:
-            await self.drone.action.set_takeoff_altitude(2.0)
+            await self.drone.action.set_takeoff_altitude(self.BASE_ALTITUDE_M)
         except Exception:
             pass
-        print("Takeoff to 2.0m")
+        print(f"Takeoff to {self.BASE_ALTITUDE_M:.1f}m")
         await self.drone.action.takeoff()
         async for pos in self.drone.telemetry.position():
-            if float(pos.relative_altitude_m) >= 2.0 - 0.20:
+            if float(pos.relative_altitude_m) >= self.BASE_ALTITUDE_M - 0.20:
                 break
         print("Takeoff complete")
         await asyncio.sleep(2.0)
@@ -168,7 +145,6 @@ class Mission(MinimalAutonomy):
             if not self.running:
                 return
             self.current_ned = (ned.position.north_m, ned.position.east_m)
-            self.visited_cells.add(self._cell_for(*self.current_ned))
 
     async def _poll_attitude(self):
         async for att in self.drone.telemetry.attitude_euler():
@@ -197,36 +173,112 @@ class Mission(MinimalAutonomy):
         await self.hold_position(1.0)
         print(f"  reached {target_alt_m:.1f}m")
 
-    async def _run_phase(self, duration_s):
+    @staticmethod
+    def _yaw_error_deg(target, current):
+        e = target - current
+        while e > 180:
+            e -= 360
+        while e < -180:
+            e += 360
+        return e
+
+    def decide_motion_toward(self, left, center, right, target_heading_deg):
+        """Goal-directed reactive nav. Heads toward target while respecting depth safety."""
+        if self.current_yaw_deg is None:
+            return "STOP", self.DECISION_PERIOD_S
+
+        err = self._yaw_error_deg(target_heading_deg, self.current_yaw_deg)
+
+        # All sides blocked → stuck escape
+        if (left < self.CRITICAL_DISTANCE_M
+                and center < self.CRITICAL_DISTANCE_M
+                and right < self.CRITICAL_DISTANCE_M):
+            self.stuck_count += 1
+            if self.stuck_count >= self.STUCK_THRESHOLD:
+                self.stuck_count = 0
+                print("  ESCAPE: stuck — turning 180°")
+                return "TURN_180", 180.0 / self.YAW_RATE_DEG_S
+            return "STOP", self.DECISION_PERIOD_S
+
+        self.stuck_count = 0
+
+        # Center clear → either fly forward (if facing target) or turn toward target
+        if center >= self.SAFE_DISTANCE_M:
+            if abs(err) < self.HEADING_TOLERANCE_DEG:
+                return "FORWARD", self.DECISION_PERIOD_S
+            # Turn toward target — duration scales with error
+            turn_time = min(abs(err), 45) / self.YAW_RATE_DEG_S
+            return ("TURN_RIGHT" if err > 0 else "TURN_LEFT"), turn_time
+
+        # Obstacle ahead — prefer side toward target, but only if that side is clear enough
+        prefer_right = err > 0
+        if prefer_right and right >= self.CRITICAL_DISTANCE_M:
+            return "TURN_RIGHT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
+        if (not prefer_right) and left >= self.CRITICAL_DISTANCE_M:
+            return "TURN_LEFT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
+        # Target side blocked — fall back to clearer side
+        if left >= right:
+            return "TURN_LEFT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
+        return "TURN_RIGHT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
+
+    async def fly_to_waypoint(self, name, target_n, target_e, altitude):
+        """Goal-directed nav to (target_n, target_e) at given altitude."""
+        print(f"  → {name} ({target_n:.1f}, {target_e:.1f}) @ {altitude:.1f}m")
         loop = asyncio.get_running_loop()
-        end_time = loop.time() + duration_s
-        prev_action = None
-        step = 0
-        while self.running and loop.time() < end_time:
+        start = loop.time()
+        last_log = 0.0
+        while self.running and loop.time() - start < self.WAYPOINT_TIMEOUT_S:
+            if self.current_ned is None:
+                await asyncio.sleep(0.1)
+                continue
+            cn, ce = self.current_ned
+            dn = target_n - cn
+            de = target_e - ce
+            dist = math.sqrt(dn * dn + de * de)
+            if dist < self.WAYPOINT_TOLERANCE_M:
+                print(f"    arrived ({dist:.1f}m from target)")
+                return True
+
+            now = loop.time()
+            if now - last_log >= 5.0:
+                print(f"    dist={dist:.1f}m yaw={self.current_yaw_deg:.0f}°")
+                last_log = now
+
+            target_heading_deg = math.degrees(math.atan2(de, dn))
+
             depth_frame = self.receiver.get_frame()
             if depth_frame is None:
                 await self.hold_position(self.DECISION_PERIOD_S)
                 continue
             left, center, right = self.compute_clearances(depth_frame)
-            action, action_duration = self.decide_motion(left, center, right)
-            # Log on action change, on STOP/ESCAPE, or every 10 steps
-            should_log = (action != prev_action) or (action in ("STOP", "TURN_180")) or (step % 10 == 0)
-            if should_log:
-                remaining = int(end_time - loop.time())
-                visited_n = len(self.visited_cells)
-                print(f"{action} | L={left:.2f} C={center:.2f} R={right:.2f} | cells={visited_n} | t-{remaining}s")
-            prev_action = action
-            step += 1
+            action, action_duration = self.decide_motion_toward(left, center, right, target_heading_deg)
+
             if action == "FORWARD":
                 await self.fly_forward(action_duration)
             elif action == "TURN_LEFT":
                 await self.yaw_in_place(-self.YAW_RATE_DEG_S, action_duration)
-            elif action == "TURN_RIGHT":
-                await self.yaw_in_place(self.YAW_RATE_DEG_S, action_duration)
-            elif action == "TURN_180":
+            elif action in ("TURN_RIGHT", "TURN_180"):
                 await self.yaw_in_place(self.YAW_RATE_DEG_S, action_duration)
             else:
                 await self.hold_position(action_duration)
+        print(f"    TIMEOUT reaching {name}")
+        return False
+
+    async def scan_360(self):
+        """4 quarter turns in place at faster yaw rate, pausing for detection."""
+        print("  ↺ scan 360°")
+        for _ in range(4):
+            await self.yaw_in_place(self.SCAN_YAW_RATE_DEG_S, 90.0 / self.SCAN_YAW_RATE_DEG_S)
+            await self.hold_position(self.SCAN_QUARTER_HOLD_S)
+
+    async def scan_multi_altitude(self, altitudes):
+        """Scan 360° at each altitude in list. Returns to BASE_ALTITUDE_M after."""
+        for alt in altitudes:
+            await self._climb_to_altitude(alt)
+            await self.scan_360()
+        # Restore base altitude for next transit
+        if altitudes[-1] != self.BASE_ALTITUDE_M:
+            await self._climb_to_altitude(self.BASE_ALTITUDE_M)
 
     async def run(self):
         print("Starting RoboVerse Qualifier mission")
@@ -242,15 +294,18 @@ class Mission(MinimalAutonomy):
             await self.arm_and_takeoff()
             await self.start_offboard()
 
-            for i, (duration, altitude) in enumerate(zip(self.PHASE_DURATIONS_S, self.PHASE_ALTITUDES_M)):
+            # Single-pass waypoint tour with per-waypoint multi-altitude scans
+            await self._climb_to_altitude(self.BASE_ALTITUDE_M)
+            for name, n, e, scan_alts in self.WAYPOINTS:
                 if not self.running:
                     break
-                print(f"\n=== PHASE {i+1}/{len(self.PHASE_ALTITUDES_M)}: altitude {altitude:.1f}m, duration {duration}s ===")
-                self.visited_cells.clear()  # fresh exploration map per altitude
-                await self._climb_to_altitude(altitude)
-                await self._run_phase(duration)
+                self.stuck_count = 0
+                if not await self.fly_to_waypoint(name, n, e, self.BASE_ALTITUDE_M):
+                    continue  # skip scan if didn't arrive
+                if scan_alts:
+                    await self.scan_multi_altitude(scan_alts)
 
-            print("\nMission phases complete")
+            print("\nMission tour complete — landing")
         except asyncio.CancelledError:
             print("Mission cancelled")
             raise

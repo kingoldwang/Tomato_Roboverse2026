@@ -151,9 +151,9 @@ async def connect(drone: System):
     except Exception:
         pass
 
-    print("[MAVSDK] Waiting for health (GPS + home)...")
+    print("[MAVSDK] Waiting for health (home + local position — vision drone, no GPS)...")
     async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
+        if health.is_home_position_ok and health.is_local_position_ok and health.is_armable:
             print("[MAVSDK] Healthy.")
             break
 
