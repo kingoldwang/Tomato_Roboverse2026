@@ -10,14 +10,16 @@ from color_detector import ColorDetector
 import asyncio
 import queue
 
-TOPIC = "/world/roboverse/model/x500_depth_0/link/camera_link/sensor/IMX214/image"
+TOPIC = "/world/roboverse/model/x500_vision_0/link/camera_link/sensor/IMX214/image"
 
 class GZPhotoDetectorSaver:
-    def __init__(self, topic, save_dir="output", model_path="yolov8n.pt", burst_size=30, threshold=0.5):
+    def __init__(self, topic, save_dir="output", model_path="yolov8n.pt", burst_size=30, threshold=0.5, save_cooldown_s=2.5):
         self.topic = topic
         self.save_dir = save_dir
         self.burst_size = burst_size
         self.threshold = threshold
+        self.save_cooldown_s = save_cooldown_s
+        self.last_save = {"yellow": 0.0, "red": 0.0}
 
         self.img_queue = queue.LifoQueue(maxsize=50)
 
@@ -46,14 +48,12 @@ class GZPhotoDetectorSaver:
             self.frames_remaining = numofframes
             self.is_detecting = True
             self.is_saving = False
-            print("Triggered Camera Detection Task")
 
     def trigger_capture_burst(self, numofframes=30):
         self.burst_size = numofframes
         self.frames_remaining = numofframes
         self.is_detecting = False
         self.is_saving = True
-        print("Triggered Camera Capture Task")
 
     def _image_callback(self, msg: Image):
         try:
@@ -85,23 +85,31 @@ class GZPhotoDetectorSaver:
             if self.is_detecting and self.model:
                 results = self.model(frame_rgb, conf=self.threshold, imgsz=640, verbose=False)
                 annotated = frame_bgr.copy()
-                kept_any = False
+                detected_colors = set()
                 for box in results[0].boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                     h, w = frame_bgr.shape[:2]
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(w, x2), min(h, y2)
+                    box_w, box_h = x2 - x1, y2 - y1
+                    if box_w <= 0 or box_h / box_w < 1.3:
+                        continue  # reject squat shapes (hazard barrels are squat; canisters are tall)
                     crop = frame_bgr[y1:y2, x1:x2]
                     hsv_color = ColorDetector.classify_color(crop)
                     if hsv_color is None:
                         continue  # reject: no target colour → likely architecture
-                    kept_any = True
+                    detected_colors.add(hsv_color)
                     box_colour = (0, 255, 255) if hsv_color == "yellow" else (0, 0, 255)
                     label = f"{hsv_color}_barrel {float(box.conf[0]):.2f}"
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), box_colour, 2)
                     cv2.putText(annotated, label, (x1, max(0, y1 - 6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_colour, 1, cv2.LINE_AA)
-                if kept_any:
+
+                now = time.monotonic()
+                should_save = any(now - self.last_save[c] >= self.save_cooldown_s for c in detected_colors)
+                if should_save:
+                    for c in detected_colors:
+                        self.last_save[c] = now
                     path = os.path.join(self.save_dir, f"det_{int(time.time() * 1000)}.jpg")
                     cv2.imwrite(path, annotated)
                     try:
@@ -117,7 +125,6 @@ class GZPhotoDetectorSaver:
             if self.frames_remaining == 0:
                 self.is_saving = False
                 self.is_detecting = False
-                print("Camera task complete.")
 
     async def _display_loop(self):
         while True:
@@ -151,7 +158,7 @@ async def main():
     detector = GZPhotoDetectorSaver(
         topic=TOPIC,
         save_dir="output",
-        model_path="barrels_v1.pt",
+        model_path="barrels_v2.pt",
         burst_size=30,
         threshold=0.5,
     )
