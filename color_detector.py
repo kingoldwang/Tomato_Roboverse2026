@@ -81,6 +81,7 @@ class ColorDetector:
             return None  # neither colour dominates → reject (likely wall/architecture)
         return "yellow" if yellow_count > red_count else "red"
 
+
     @staticmethod
     def annotate(frame_bgr: np.ndarray, detections: list[dict]) -> np.ndarray:
         out = frame_bgr.copy()

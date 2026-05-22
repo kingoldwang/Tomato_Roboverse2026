@@ -1,77 +1,89 @@
 #!/usr/bin/env python3
-"""
-RoboVerse 2026 Qualifier — autonomous mission.
+"""RoboVerse 2026 Qualifier mission — local cost-grid + DWA + frontier.
 
-**Qualifier uses x500_vision drone (no GPS).** Pre-flight checklist:
-  1. Start sim: ~/start_px4.sh → option 1 (x500_vision) → roboverse → no QGC
-  2. In pxh> shell BEFORE running this script:
-       commander set_ekf_origin 47.397742 8.545594 488.0
-  3. Wait for "Setting GPS origin" then "EKF (xxxxx) home position set"
-  4. Then run: python3 mission.py
+Architecture:
+  - Background tasks: position + attitude pollers, depth/RGB receivers, detector.
+  - Control loop (10 Hz):
+      1. Recentre cost grid on current drone pose; decay; mark visited.
+      2. Integrate latest depth frame into the grid.
+      3. Pick a frontier goal if we don't have one (or current is reached/stale).
+      4. Run DWA-lite to choose a (forward_speed, yaw_rate) for the next tick.
+      5. Command the drone with set_body_velocity.
+  - Altitude phases (2m → 4m → 6m) cycle on a timer.
+  - Periodic 360° scans every PERIODIC_SCAN_INTERVAL_S to look around.
 
-Without step 2, is_home_position_ok will never be True and arming will fail.
+There are no hardcoded waypoints. The goal is always derived from the local
+cost grid — the planner only knows: "this direction is free / unknown / blocked".
 
-Extends MinimalAutonomy (organiser baseline):
-- CRITICAL_DISTANCE_M raised from 0.3m to 1.5m per organiser guidance
-- FORWARD_SPEED_M_S bumped from 0.8 to 1.2 m/s
-- Readiness check uses is_home_position_ok (NOT is_global_position_ok — vision has no GPS)
-- Single-pass waypoint tour over 14 calibrated NED waypoints (workshop map)
-- Per-waypoint multi-altitude scans (2m/4m/6m) only where needed:
-    * box waypoints: all altitudes (yellow + 1-stack + 2-stack + 3-stack red possible)
-    * top_room: 2m only (yellow ground level)
-    * right_chamber: 4m + 6m (elevated red)
-- Goal-directed reactive nav between waypoints (depth avoidance + target heading)
-- YOLO + HSV detection runs continuously as background asyncio task
-- Detection JPGs saved to output/ as evidence for the judge
+Vision-drone pre-flight:
+  1. ~/start_px4.sh → option 1 (x500_vision) → roboverse → no QGC
+  2. In pxh>: commander set_ekf_origin 47.397742 8.545594 488.0
+  3. python3 mission.py
 """
 
 import asyncio
 import math
+import time
 
 from mavsdk.action import ActionError
 
 from minimal_autonomy import MinimalAutonomy
 from gzphotodetectorsaver import GZPhotoDetectorSaver, TOPIC as RGB_TOPIC
+from local_planner import (
+    CostGrid, GridConfig,
+    DwaPlanner, DwaConfig,
+    FrontierPicker, FrontierConfig,
+)
 
 
 class Mission(MinimalAutonomy):
-    CRITICAL_DISTANCE_M = 1.5
-    FORWARD_SPEED_M_S = 1.2
-
-    BASE_ALTITUDE_M = 2.0      # cruise altitude between waypoints
-    ALL_ALTITUDES_M = [2.0, 4.0, 6.0]
-    GROUND_ALT_M = [2.0]       # yellow barrels (ground level only)
-    ELEVATED_ALT_M = [4.0, 6.0]  # red barrels (elevated only)
-
+    # Altitude phases — heights to revisit, not waypoints.
+    # Strategy: prioritise 2.3m (ground yellows = uni eligibility). 4m for elevated reds.
+    # 6m dropped — 3-stack reds are rare; the 4m sweep catches 2-stack reds.
+    ALTITUDE_PHASES_M = [2.0, 4.0]
+    PHASE_DURATIONS_S = [300.0, 200.0]   # 5 min ground sweep, ~3.3 min elevated sweep
     CLIMB_SPEED_M_S = 1.2
     ALTITUDE_TOLERANCE_M = 0.3
-    DETECTION_BURST_FRAMES = 5
-    DETECTION_TRIGGER_INTERVAL_S = 2.0
-    STUCK_THRESHOLD = 3
+    # Locality-aware climbing: only climb when in open space (avoid altitude cycling in pockets)
+    OPEN_SPACE_RADIUS_M = 3.0           # free clearance required around drone to allow climbing
+    CLIMB_DEFER_TIMEOUT_S = 30.0        # if we keep deferring, climb anyway after this
 
-    # Single-pass waypoint tour with per-waypoint scan altitudes
-    # name, N, E, scan_altitudes (None = transit only)
-    WAYPOINTS = [
-        ("box_NW",         16.13,  0.38, ALL_ALTITUDES_M),    # SCAN — covers box
-        ("box_NE",         15.93, 15.59, ALL_ALTITUDES_M),    # SCAN — covers box other angle
-        ("box_exit",       17.59,  8.11, None),               # transit (W back to opening)
-        ("corridor",       27.70,  7.77, None),               # transit (N through opening)
-        ("tunnel_entry",   29.94, 19.64, None),               # transit (E along upper corridor)
-        ("tunnel_bend",    35.62, 18.36, None),               # transit (N up top-room tunnel)
-        ("tunnel_aligned", 35.73, 16.15, None),               # transit (W after bend)
-        ("top_room",       40.17, 15.84, GROUND_ALT_M),       # SCAN — yellow only
-        ("back_aligned",   35.73, 16.15, None),               # backtrack
-        ("back_bend",      35.62, 18.36, None),
-        ("back_entry",     29.94, 19.64, None),
-        ("corridor_east",  27.50, 31.95, None),               # transit (E along corridor)
-        ("alcove_entry",   21.54, 32.19, None),               # transit (S into tunnel)
-        ("right_chamber",  17.77, 32.43, ELEVATED_ALT_M),     # SCAN — elevated red only
-    ]
-    WAYPOINT_TOLERANCE_M = 1.5
-    WAYPOINT_TIMEOUT_S = 60.0
-    HEADING_TOLERANCE_DEG = 20.0
-    SCAN_QUARTER_HOLD_S = 1.0
+    # Detection cadence
+    DETECTION_BURST_FRAMES = 5            # baseline periodic burst (during forward motion)
+    DETECTION_TRIGGER_INTERVAL_S = 2.0
+    DETECTION_REACHED_BURST = 15          # bigger burst when arriving at a frontier
+    DETECTION_SCAN_BURST = 12             # bigger burst after a 360° scan
+    DETECTION_SKIP_LABELS = {"ROTATE_SAFE", "HOVER"}  # don't waste burst while wedged
+
+    # Persistent escape — if N stales cluster in one area, ban the area entirely
+    CLUSTER_RADIUS_M = 3.0
+    CLUSTER_TRIGGER_COUNT = 3             # 3 stales within radius → ban this area
+
+    # Control loop
+    CONTROL_TICK_S = 0.1
+    PLAN_INTERVAL_S = 0.3   # replan every N ticks at this period
+    GRID_VISIT_RADIUS_M = 1.6   # marks drone's footprint + a bit — prevents "frontier inside me"
+
+    # 360° scan cadence
+    PERIODIC_SCAN_INTERVAL_S = 50.0
+    SCAN_QUARTER_HOLD_S = 0.4
     SCAN_YAW_RATE_DEG_S = 90.0
+
+    # Frontier handling
+    FRONTIER_TIMEOUT_S = 20.0
+    FRONTIER_REACH_M = 1.5      # was 1.0 — match cell size; avoids near-zero picks
+    FRONTIER_MIN_DIST_M = 3.0   # ignore frontiers closer than this — forces outward exploration
+
+    # Dead-end escape: if we blacklist this many frontiers within a short window, switch to "go far" mode
+    DEAD_END_BLACKLIST_COUNT = 3
+    DEAD_END_WINDOW_S = 45.0
+
+    # Return-to-spawn after altitude climb — forces re-scan of main box at the new altitude
+    RETURN_TARGET_NED = (2.0, 2.0)   # central-ish point inside main box
+    RETURN_REACH_M = 3.0             # close enough to spawn area to call it done
+    RETURN_TIMEOUT_S = 60.0          # bail if return takes too long (don't burn phase budget)
+
+    MISSION_DURATION_S = 540.0   # 9 min; 1 min landing buffer
 
     def __init__(self, depth_topic="/depth_camera", rgb_topic=RGB_TOPIC, model_path="barrels_v2.pt"):
         super().__init__(depth_topic=depth_topic)
@@ -79,17 +91,28 @@ class Mission(MinimalAutonomy):
             topic=rgb_topic,
             save_dir="output",
             model_path=model_path,
-            threshold=0.5,
+            threshold=0.35,   # lowered from 0.5 — catch low-confidence barrels at distance/angle; HSV filter rejects FPs
         )
         self.current_ned = None
         self.current_yaw_deg = None
-        self.stuck_count = 0
+
+        self.grid = CostGrid(GridConfig())
+        self.dwa = DwaPlanner(self.grid, DwaConfig())
+        self.frontier = FrontierPicker(self.grid, FrontierConfig(
+            reach_tolerance_m=self.FRONTIER_REACH_M,
+            min_distance_m=self.FRONTIER_MIN_DIST_M,
+            timeout_s=self.FRONTIER_TIMEOUT_S,
+            visit_radius_m=self.GRID_VISIT_RADIUS_M,
+        ))
+        self.goal_world = None      # (n, e) of current frontier goal
+        self.goal_picked_at = 0.0
+        self.recent_blacklists: list[float] = []  # timestamps of recent stale-frontier blacklists
+        self.recent_stale_positions: list[tuple[float, float]] = []  # world coords of recent stales (cluster detection)
+        self.current_motion_label = "FORWARD"  # last DWA label — used to gate detection bursts
+
+    # ---------------- vision-drone readiness ----------------
 
     async def wait_until_ready(self, timeout_s=60.0):
-        """Vision drone readiness: wait for is_home_position_ok (NOT GPS).
-
-        Requires `commander set_ekf_origin` to have been run in pxh> shell.
-        """
         print("Waiting for is_home_position_ok=True (vision drone, no GPS)...")
         print("  → If this hangs, run in pxh>: commander set_ekf_origin 47.397742 8.545594 488.0")
         loop = asyncio.get_running_loop()
@@ -115,7 +138,6 @@ class Mission(MinimalAutonomy):
             await asyncio.sleep(0.5)
 
     async def arm_and_takeoff(self):
-        """Override base: strict readiness wait + arm retry with delay."""
         await self.wait_until_ready()
         for attempt in range(3):
             try:
@@ -129,16 +151,18 @@ class Mission(MinimalAutonomy):
                 await asyncio.sleep(3.0)
 
         try:
-            await self.drone.action.set_takeoff_altitude(self.BASE_ALTITUDE_M)
+            await self.drone.action.set_takeoff_altitude(self.ALTITUDE_PHASES_M[0])
         except Exception:
             pass
-        print(f"Takeoff to {self.BASE_ALTITUDE_M:.1f}m")
+        print(f"Takeoff to {self.ALTITUDE_PHASES_M[0]:.1f}m")
         await self.drone.action.takeoff()
         async for pos in self.drone.telemetry.position():
-            if float(pos.relative_altitude_m) >= self.BASE_ALTITUDE_M - 0.20:
+            if float(pos.relative_altitude_m) >= self.ALTITUDE_PHASES_M[0] - 0.20:
                 break
         print("Takeoff complete")
         await asyncio.sleep(2.0)
+
+    # ---------------- background pollers ----------------
 
     async def _poll_position(self):
         async for ned in self.drone.telemetry.position_velocity_ned():
@@ -155,8 +179,12 @@ class Mission(MinimalAutonomy):
     async def _trigger_detection_loop(self):
         await asyncio.sleep(3.0)
         while self.running:
-            self.detector.trigger_detection_burst(self.DETECTION_BURST_FRAMES)
+            # Skip the burst if we're currently wedged/spinning — we're looking at walls
+            if self.current_motion_label not in self.DETECTION_SKIP_LABELS:
+                self.detector.trigger_detection_burst(self.DETECTION_BURST_FRAMES)
             await asyncio.sleep(self.DETECTION_TRIGGER_INTERVAL_S)
+
+    # ---------------- altitude / scan ----------------
 
     async def _climb_to_altitude(self, target_alt_m):
         print(f"Climbing to {target_alt_m:.1f}m")
@@ -173,115 +201,223 @@ class Mission(MinimalAutonomy):
         await self.hold_position(1.0)
         print(f"  reached {target_alt_m:.1f}m")
 
-    @staticmethod
-    def _yaw_error_deg(target, current):
-        e = target - current
-        while e > 180:
-            e -= 360
-        while e < -180:
-            e += 360
-        return e
-
-    def decide_motion_toward(self, left, center, right, target_heading_deg):
-        """Goal-directed reactive nav. Heads toward target while respecting depth safety."""
-        if self.current_yaw_deg is None:
-            return "STOP", self.DECISION_PERIOD_S
-
-        err = self._yaw_error_deg(target_heading_deg, self.current_yaw_deg)
-
-        # All sides blocked → stuck escape
-        if (left < self.CRITICAL_DISTANCE_M
-                and center < self.CRITICAL_DISTANCE_M
-                and right < self.CRITICAL_DISTANCE_M):
-            self.stuck_count += 1
-            if self.stuck_count >= self.STUCK_THRESHOLD:
-                self.stuck_count = 0
-                print("  ESCAPE: stuck — turning 180°")
-                return "TURN_180", 180.0 / self.YAW_RATE_DEG_S
-            return "STOP", self.DECISION_PERIOD_S
-
-        self.stuck_count = 0
-
-        # Center clear → either fly forward (if facing target) or turn toward target
-        if center >= self.SAFE_DISTANCE_M:
-            if abs(err) < self.HEADING_TOLERANCE_DEG:
-                return "FORWARD", self.DECISION_PERIOD_S
-            # Turn toward target — duration scales with error
-            turn_time = min(abs(err), 45) / self.YAW_RATE_DEG_S
-            return ("TURN_RIGHT" if err > 0 else "TURN_LEFT"), turn_time
-
-        # Obstacle ahead — prefer side toward target, but only if that side is clear enough
-        prefer_right = err > 0
-        if prefer_right and right >= self.CRITICAL_DISTANCE_M:
-            return "TURN_RIGHT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
-        if (not prefer_right) and left >= self.CRITICAL_DISTANCE_M:
-            return "TURN_LEFT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
-        # Target side blocked — fall back to clearer side
-        if left >= right:
-            return "TURN_LEFT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
-        return "TURN_RIGHT", self.TURN_DEGREES / self.YAW_RATE_DEG_S
-
-    async def fly_to_waypoint(self, name, target_n, target_e, altitude):
-        """Goal-directed nav to (target_n, target_e) at given altitude."""
-        print(f"  → {name} ({target_n:.1f}, {target_e:.1f}) @ {altitude:.1f}m")
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        last_log = 0.0
-        while self.running and loop.time() - start < self.WAYPOINT_TIMEOUT_S:
-            if self.current_ned is None:
-                await asyncio.sleep(0.1)
-                continue
-            cn, ce = self.current_ned
-            dn = target_n - cn
-            de = target_e - ce
-            dist = math.sqrt(dn * dn + de * de)
-            if dist < self.WAYPOINT_TOLERANCE_M:
-                print(f"    arrived ({dist:.1f}m from target)")
-                return True
-
-            now = loop.time()
-            if now - last_log >= 5.0:
-                print(f"    dist={dist:.1f}m yaw={self.current_yaw_deg:.0f}°")
-                last_log = now
-
-            target_heading_deg = math.degrees(math.atan2(de, dn))
-
-            depth_frame = self.receiver.get_frame()
-            if depth_frame is None:
-                await self.hold_position(self.DECISION_PERIOD_S)
-                continue
-            left, center, right = self.compute_clearances(depth_frame)
-            action, action_duration = self.decide_motion_toward(left, center, right, target_heading_deg)
-
-            if action == "FORWARD":
-                await self.fly_forward(action_duration)
-            elif action == "TURN_LEFT":
-                await self.yaw_in_place(-self.YAW_RATE_DEG_S, action_duration)
-            elif action in ("TURN_RIGHT", "TURN_180"):
-                await self.yaw_in_place(self.YAW_RATE_DEG_S, action_duration)
-            else:
-                await self.hold_position(action_duration)
-        print(f"    TIMEOUT reaching {name}")
-        return False
-
     async def scan_360(self):
-        """4 quarter turns in place at faster yaw rate, pausing for detection."""
         print("  ↺ scan 360°")
         for _ in range(4):
             await self.yaw_in_place(self.SCAN_YAW_RATE_DEG_S, 90.0 / self.SCAN_YAW_RATE_DEG_S)
-            await self.hold_position(self.SCAN_QUARTER_HOLD_S)
+            # Integrate depth during the dwell so the new view enters the grid
+            for _ in range(int(self.SCAN_QUARTER_HOLD_S / self.CONTROL_TICK_S)):
+                await self.set_body_velocity(0.0, 0.0, 0.0, 0.0)
+                await asyncio.sleep(self.CONTROL_TICK_S)
+                self._integrate_one_frame()
+        # 360° gives us the richest view of the local area — fire a bigger burst now
+        self.detector.trigger_detection_burst(self.DETECTION_SCAN_BURST)
 
-    async def scan_multi_altitude(self, altitudes):
-        """Scan 360° at each altitude in list. Returns to BASE_ALTITUDE_M after."""
-        for alt in altitudes:
-            await self._climb_to_altitude(alt)
-            await self.scan_360()
-        # Restore base altitude for next transit
-        if altitudes[-1] != self.BASE_ALTITUDE_M:
-            await self._climb_to_altitude(self.BASE_ALTITUDE_M)
+    async def _return_to_spawn_area(self):
+        """Fly toward RETURN_TARGET_NED using DWA. Bails on timeout.
+
+        Called after a phase-2 climb so the drone re-traverses main box at the new altitude
+        (where elevated reds become visible). Detection bursts fire during the flight.
+        """
+        loop = asyncio.get_running_loop()
+        tn, te = self.RETURN_TARGET_NED
+        print(f"  ↩ returning to main box ({tn:.1f},{te:.1f}) for re-scan at altitude")
+        start = loop.time()
+        self.dwa.reset_commitment()
+        last_burst = 0.0
+        while self.running and (loop.time() - start) < self.RETURN_TIMEOUT_S:
+            self._integrate_one_frame()
+            if self.current_ned is None or self.current_yaw_deg is None:
+                await asyncio.sleep(self.CONTROL_TICK_S)
+                continue
+            cn, ce = self.current_ned
+            d = math.hypot(tn - cn, te - ce)
+            if d < self.RETURN_REACH_M:
+                print(f"  ↩ reached main box at ({cn:.1f},{ce:.1f})")
+                self.detector.trigger_detection_burst(self.DETECTION_REACHED_BURST)
+                return
+            cmd = self.dwa.plan(cn, ce, self.current_yaw_deg, tn, te)
+            self.current_motion_label = cmd.label
+            await self.set_body_velocity(cmd.forward_m_s, 0.0, 0.0, cmd.yaw_rate_deg_s)
+            # Periodic burst during the return — detect anything we fly over
+            now = loop.time()
+            if now - last_burst >= 2.0:
+                if cmd.label not in self.DETECTION_SKIP_LABELS:
+                    self.detector.trigger_detection_burst(self.DETECTION_BURST_FRAMES)
+                last_burst = now
+            await asyncio.sleep(self.CONTROL_TICK_S)
+        print(f"  ↩ return timed out after {self.RETURN_TIMEOUT_S:.0f}s — resuming frontier explore from here")
+
+    # ---------------- grid maintenance ----------------
+
+    def _integrate_one_frame(self) -> bool:
+        """Pull the latest depth frame, integrate into grid. Returns False if no frame yet."""
+        if self.current_ned is None or self.current_yaw_deg is None:
+            return False
+        depth = self.receiver.get_frame()
+        if depth is None:
+            return False
+        n, e = self.current_ned
+        self.grid.recenter(n, e)
+        self.grid.tick_decay()
+        self.grid.mark_visited(n, e, self.GRID_VISIT_RADIUS_M)
+        self.grid.integrate_depth(depth, n, e, self.current_yaw_deg)
+        return True
+
+    def _is_open_space(self) -> bool:
+        """True if drone has free clearance >= OPEN_SPACE_RADIUS_M in all 4 cardinal directions.
+        Used to decide whether to commit to an altitude change (which is costly in pockets).
+        """
+        if self.current_ned is None:
+            return False
+        n, e = self.current_ned
+        r = self.OPEN_SPACE_RADIUS_M
+        # Sample 8 cells in a ring; require all to be non-occupied
+        import math as _m
+        for ang_deg in range(0, 360, 45):
+            a = _m.radians(ang_deg)
+            sn, se = n + r * _m.cos(a), e + r * _m.sin(a)
+            i, j = self.grid.world_to_cell(sn, se)
+            if not self.grid.in_bounds(i, j):
+                return False
+            if self.grid.is_occupied(i, j):
+                return False
+        return True
+
+    # ---------------- main control loop ----------------
+
+    async def explore_loop(self):
+        loop = asyncio.get_running_loop()
+        mission_end = loop.time() + self.MISSION_DURATION_S
+        phase_idx = 0
+        phase_end = loop.time() + self.PHASE_DURATIONS_S[phase_idx]
+        climb_pending_since = None   # set when phase elapsed but we're in a pocket
+        last_scan = loop.time()
+        last_plan = 0.0
+        last_log = 0.0
+        last_command = (0.0, 0.0)
+
+        await self._climb_to_altitude(self.ALTITUDE_PHASES_M[phase_idx])
+
+        # Prime the grid with a few frames before flying
+        for _ in range(20):
+            self._integrate_one_frame()
+            await asyncio.sleep(self.CONTROL_TICK_S)
+
+        while self.running and loop.time() < mission_end:
+            now = loop.time()
+
+            # Altitude phase transition — defer if drone is in a tight pocket
+            if now >= phase_end and phase_idx + 1 < len(self.ALTITUDE_PHASES_M):
+                in_open = self._is_open_space()
+                if climb_pending_since is None:
+                    climb_pending_since = now
+                force_climb = (now - climb_pending_since) >= self.CLIMB_DEFER_TIMEOUT_S
+                if in_open or force_climb:
+                    phase_idx += 1
+                    phase_end = now + self.PHASE_DURATIONS_S[phase_idx]
+                    climb_pending_since = None
+                    reason = "open space" if in_open else "deferred timeout"
+                    print(f"\n=== ALTITUDE PHASE {phase_idx + 1}/{len(self.ALTITUDE_PHASES_M)}: "
+                          f"{self.ALTITUDE_PHASES_M[phase_idx]:.1f}m ({reason}) ===")
+                    await self._climb_to_altitude(self.ALTITUDE_PHASES_M[phase_idx])
+                    # Reset visited-cell memory so frontier picker re-explores the whole map at the new altitude.
+                    # Without this, the main box (visited at 2m) would never be re-scanned at 4m → elevated reds missed.
+                    self.grid.visited[:, :] = False
+                    self.frontier.clear_blacklist()
+                    self.recent_blacklists.clear()
+                    self.recent_stale_positions.clear()
+                    self.goal_world = None
+                    print("  ↻ visited grid + blacklists cleared — re-explore at new altitude")
+                    # Fly back to main box at new altitude — picker alone won't pull drone south from N corridor
+                    await self._return_to_spawn_area()
+                    last_scan = loop.time()
+                    continue
+
+            # Periodic 360° scan
+            if now - last_scan >= self.PERIODIC_SCAN_INTERVAL_S:
+                await self.scan_360()
+                last_scan = loop.time()
+                continue
+
+            # Always integrate the freshest depth view
+            self._integrate_one_frame()
+
+            # Frontier management
+            if self.current_ned is not None:
+                cn, ce = self.current_ned
+                if self.goal_world is not None:
+                    gn, ge = self.goal_world
+                    d = math.hypot(gn - cn, ge - ce)
+                    stale = (now - self.goal_picked_at) > self.FRONTIER_TIMEOUT_S
+                    if d < self.FRONTIER_REACH_M or stale:
+                        if stale:
+                            print(f"  ✗ frontier stale, blacklisting ({gn:.1f},{ge:.1f})")
+                            self.frontier.blacklist_cell(gn, ge)
+                            self.recent_blacklists.append(now)
+                            self.recent_stale_positions.append((gn, ge))
+                            # Cluster check: if too many stales fell inside CLUSTER_RADIUS_M, ban this whole area
+                            nearby = [p for p in self.recent_stale_positions
+                                      if math.hypot(p[0] - gn, p[1] - ge) <= self.CLUSTER_RADIUS_M]
+                            if len(nearby) >= self.CLUSTER_TRIGGER_COUNT:
+                                cn0 = sum(p[0] for p in nearby) / len(nearby)
+                                ce0 = sum(p[1] for p in nearby) / len(nearby)
+                                # Blacklist a bigger neighbourhood around the cluster centroid
+                                for r_step in (0.0, 0.6, 1.2, 1.8, 2.4):
+                                    for ang in range(0, 360, 30):
+                                        self.frontier.blacklist_cell(
+                                            cn0 + r_step * math.cos(math.radians(ang)),
+                                            ce0 + r_step * math.sin(math.radians(ang)),
+                                        )
+                                print(f"  ⊘ cluster ban around ({cn0:.1f},{ce0:.1f}) "
+                                      f"after {len(nearby)} nearby stales")
+                                # Drop these stale entries so we don't re-trigger immediately
+                                self.recent_stale_positions = [p for p in self.recent_stale_positions
+                                                                if p not in nearby]
+                        else:
+                            print(f"  ✓ reached frontier ({gn:.1f},{ge:.1f})")
+                            # Fire a long burst — we deliberately came here, look hard
+                            self.detector.trigger_detection_burst(self.DETECTION_REACHED_BURST)
+                        self.goal_world = None
+                if self.goal_world is None:
+                    # Trim old blacklist timestamps outside the dead-end window
+                    cutoff = now - self.DEAD_END_WINDOW_S
+                    self.recent_blacklists = [t for t in self.recent_blacklists if t >= cutoff]
+                    escape = len(self.recent_blacklists) >= self.DEAD_END_BLACKLIST_COUNT
+                    new_goal = self.frontier.pick(cn, ce, self.current_yaw_deg, prefer_far=escape)
+                    if new_goal is not None:
+                        self.goal_world = new_goal
+                        self.goal_picked_at = now
+                        self.dwa.reset_commitment()
+                        tag = " [ESCAPE]" if escape else ""
+                        print(f"  → frontier ({new_goal[0]:.1f},{new_goal[1]:.1f}){tag}")
+                        if escape:
+                            self.recent_blacklists.clear()  # reset after committing to escape
+
+            # Replan periodically; otherwise hold last command
+            if now - last_plan >= self.PLAN_INTERVAL_S and self.current_ned is not None and self.current_yaw_deg is not None:
+                gn, ge = self.goal_world if self.goal_world else (None, None)
+                cmd = self.dwa.plan(self.current_ned[0], self.current_ned[1],
+                                    self.current_yaw_deg, gn, ge)
+                last_command = (cmd.forward_m_s, cmd.yaw_rate_deg_s)
+                self.current_motion_label = cmd.label
+                last_plan = now
+                if now - last_log >= 1.0:
+                    last_log = now
+                    remaining = int(mission_end - now)
+                    goal_str = f"({gn:.1f},{ge:.1f})" if gn is not None else "none"
+                    print(f"{cmd.label} v={cmd.forward_m_s:.2f} w={cmd.yaw_rate_deg_s:+.0f}°/s "
+                          f"goal={goal_str} t-{remaining}s")
+
+            # Push command to drone (steady velocity at CONTROL_TICK_S resolution)
+            v, w = last_command
+            await self.set_body_velocity(v, 0.0, 0.0, w)
+            await asyncio.sleep(self.CONTROL_TICK_S)
+
+        print("\nMission time elapsed — landing")
 
     async def run(self):
-        print("Starting RoboVerse Qualifier mission")
+        print("Starting RoboVerse Qualifier mission (cost-grid + DWA + frontier)")
         bg_tasks = []
         try:
             bg_tasks.append(asyncio.create_task(self.detector.run()))
@@ -293,19 +429,8 @@ class Mission(MinimalAutonomy):
 
             await self.arm_and_takeoff()
             await self.start_offboard()
+            await self.explore_loop()
 
-            # Single-pass waypoint tour with per-waypoint multi-altitude scans
-            await self._climb_to_altitude(self.BASE_ALTITUDE_M)
-            for name, n, e, scan_alts in self.WAYPOINTS:
-                if not self.running:
-                    break
-                self.stuck_count = 0
-                if not await self.fly_to_waypoint(name, n, e, self.BASE_ALTITUDE_M):
-                    continue  # skip scan if didn't arrive
-                if scan_alts:
-                    await self.scan_multi_altitude(scan_alts)
-
-            print("\nMission tour complete — landing")
         except asyncio.CancelledError:
             print("Mission cancelled")
             raise
