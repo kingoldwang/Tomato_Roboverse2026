@@ -46,7 +46,7 @@ class DwaConfig:
     yaw_rates_deg: tuple = (-50.0, -30.0, -15.0, 0.0, 15.0, 30.0, 50.0)
     stationary_yaw_rates_deg: tuple = (-60.0, -40.0, -20.0, 20.0, 40.0, 60.0)
     hover_option: bool = True           # allow 0-velocity option as a fallback
-    hard_cost_reject: float = 0.55      # any cell on path with occ >= this → reject
+    hard_cost_reject: float = 0.65      # any cell on path with occ >= this → reject (was 0.55 — too quick to abandon marginal paths)
     weight_goal: float = 6.0            # reward for closing distance to goal
     weight_max_cost: float = 4.0        # penalise highest-cost cell on the path
     weight_avg_cost: float = 2.0        # penalise average cost

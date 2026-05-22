@@ -6,4 +6,6 @@ __pycache__/
 
 captured_images/
 output/
+training_frames/
 *.zip
+RETRAINING_BRIEF.md

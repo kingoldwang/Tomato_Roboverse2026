@@ -13,13 +13,22 @@ import queue
 TOPIC = "/world/roboverse/model/x500_vision_0/link/camera_link/sensor/IMX214/image"
 
 class GZPhotoDetectorSaver:
-    def __init__(self, topic, save_dir="output", model_path="yolov8n.pt", burst_size=30, threshold=0.5, save_cooldown_s=2.5):
+    def __init__(self, topic, save_dir="output", model_path="yolov8n.pt", burst_size=30, threshold=0.5,
+                 save_cooldown_s=2.5, training_dir="training_frames", training_interval_s=1.0):
         self.topic = topic
         self.save_dir = save_dir
         self.burst_size = burst_size
         self.threshold = threshold
         self.save_cooldown_s = save_cooldown_s
         self.last_save = {"yellow": 0.0, "red": 0.0}
+
+        # Training-frame capture: hands-off save of raw RGB frames during the whole mission,
+        # for later retraining. Independent of detection bursts.
+        self.training_dir = training_dir
+        self.training_interval_s = training_interval_s
+        self.training_last_save = 0.0
+        self.training_count = 0
+        os.makedirs(self.training_dir, exist_ok=True)
 
         self.img_queue = queue.LifoQueue(maxsize=50)
 
@@ -80,6 +89,15 @@ class GZPhotoDetectorSaver:
             self.live_queue.put_nowait(frame_bgr)
         except queue.Full:
             pass
+
+        # Background training-frame capture — commented out (already collected enough data).
+        # Re-enable for more retraining captures.
+        # now = time.monotonic()
+        # if now - self.training_last_save >= self.training_interval_s:
+        #     self.training_last_save = now
+        #     path = os.path.join(self.training_dir, f"train_{int(time.time() * 1000)}.jpg")
+        #     cv2.imwrite(path, frame_bgr)
+        #     self.training_count += 1
 
         if self.frames_remaining > 0 and (self.is_detecting or self.is_saving):
             if self.is_detecting and self.model:

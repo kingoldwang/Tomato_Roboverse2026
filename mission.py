@@ -329,8 +329,10 @@ class Mission(MinimalAutonomy):
                     self.recent_stale_positions.clear()
                     self.goal_world = None
                     print("  ↻ visited grid + blacklists cleared — re-explore at new altitude")
-                    # Fly back to main box at new altitude — picker alone won't pull drone south from N corridor
-                    await self._return_to_spawn_area()
+                    # Return-to-spawn disabled: was consuming ~60s of phase 2 budget. Phase 2 now
+                    # explores from wherever the climb happened (usually N corridor / E-W corridor area),
+                    # which is higher-value than re-scanning main box.
+                    # await self._return_to_spawn_area()
                     last_scan = loop.time()
                     continue
 
